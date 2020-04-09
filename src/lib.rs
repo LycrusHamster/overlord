@@ -12,6 +12,8 @@ mod codec;
 pub mod error;
 /// Create and run the overlord consensus process.
 pub mod overlord;
+#[allow(missing_docs)]
+pub mod record;
 /// serialize Bytes in hex format
 pub mod serde_hex;
 /// serialize Vec<Bytes> in hex format

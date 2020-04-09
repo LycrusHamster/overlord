@@ -5,16 +5,25 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use parking_lot::RwLock;
 
 use crate::error::ConsensusError;
+use crate::record::RRConfig;
 use crate::state::process::State;
-use crate::types::{Address, Node, OverlordMsg};
+use crate::state::verifier::{Verifier, VerifyReq};
+use crate::types::{Address, Node, OverlordMsg, VerifyResp};
 use crate::DurationConfig;
 use crate::{smr::SMR, timer::Timer};
 use crate::{Codec, Consensus, ConsensusResult, Crypto, Wal};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 type Pile<T> = RwLock<Option<T>>;
 
 /// An overlord consensus instance.
-pub struct Overlord<T: Codec, F: Consensus<T>, C: Crypto, W: Wal> {
+pub struct Overlord<
+    T: Codec + Unpin + Serialize + DeserializeOwned,
+    F: Consensus<T>,
+    C: Crypto,
+    W: Wal + Send,
+> {
     sender:    Pile<UnboundedSender<(Context, OverlordMsg<T>)>>,
     state_rx:  Pile<UnboundedReceiver<(Context, OverlordMsg<T>)>>,
     address:   Pile<Address>,
@@ -25,10 +34,10 @@ pub struct Overlord<T: Codec, F: Consensus<T>, C: Crypto, W: Wal> {
 
 impl<T, F, C, W> Overlord<T, F, C, W>
 where
-    T: Codec + Send + Sync + 'static,
+    T: Codec + Send + Sync + Unpin + Serialize + DeserializeOwned + 'static,
     F: Consensus<T> + 'static,
     C: Crypto + Send + Sync + 'static,
-    W: Wal + 'static,
+    W: Wal + Send + 'static,
 {
     /// Create a new overlord and return an overlord instance with an unbounded receiver.
     pub fn new(address: Address, consensus: Arc<F>, crypto: Arc<C>, wal: Arc<W>) -> Self {
@@ -57,12 +66,20 @@ where
         interval: u64,
         authority_list: Vec<Node>,
         timer_config: Option<DurationConfig>,
+        rr_config: RRConfig,
     ) -> ConsensusResult<()> {
-        let (mut smr_provider, evt_state, evt_timer) = SMR::new();
+        let (mut smr_provider, evt_state, evt_timer) = SMR::new(rr_config.clone());
         let smr_handler = smr_provider.take_smr();
-        let timer = Timer::new(evt_timer, smr_handler.clone(), interval, timer_config);
+        let timer = Timer::new(
+            evt_timer,
+            smr_handler.clone(),
+            interval,
+            timer_config,
+            rr_config.clone(),
+        );
 
-        let (rx, mut state, resp) = {
+        // let (rx, mut state, resp) =
+        let (mut state, verifier) = {
             let mut state_rx = self.state_rx.write();
             let mut address = self.address.write();
             let mut consensus = self.consensus.write();
@@ -71,14 +88,32 @@ where
             // let sender = self.sender.read();
 
             let tmp_rx = state_rx.take().unwrap();
-            let (tmp_state, tmp_resp) = State::new(
+
+            let (tx_v_req, rx_v_req) = unbounded::<VerifyReq<T>>();
+            let (tx_v_resp, rx_v_resp) = unbounded::<VerifyResp>();
+
+            let consensus_function = consensus.take().unwrap();
+
+            // let (tmp_state, tmp_resp) = State::new(
+            let state = State::new(
                 smr_handler,
                 address.take().unwrap(),
                 interval,
                 authority_list,
-                consensus.take().unwrap(),
+                Arc::clone(&consensus_function),
                 crypto.take().unwrap(),
                 wal.take().unwrap(),
+                rr_config.clone(),
+                tx_v_req,
+                rx_v_resp,
+                tmp_rx,
+                evt_state,
+            );
+            let verifier = Verifier::new(
+                rx_v_req,
+                tx_v_resp,
+                Arc::clone(&consensus_function),
+                rr_config,
             );
 
             // assert!(sender.is_none());
@@ -88,7 +123,8 @@ where
             assert!(state_rx.is_none());
             assert!(wal.is_none());
 
-            (tmp_rx, tmp_state, tmp_resp)
+            //(tmp_rx, tmp_state, tmp_resp)
+            (state, verifier)
         };
 
         log::info!("Overlord start running");
@@ -99,8 +135,11 @@ where
         // Run timer.
         timer.run();
 
+        verifier.run();
+
         // Run state.
-        state.run(rx, evt_state, resp).await;
+        // state.run(rx, evt_state, resp).await;
+        state.run().await;
 
         Ok(())
     }

@@ -1,6 +1,7 @@
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
+use crate::record::VectorClock;
 use crate::types::Hash;
 use crate::wal::SMRBase;
 use crate::DurationConfig;
@@ -88,7 +89,7 @@ impl From<u8> for Step {
 }
 
 ///
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FromWhere {
     ///
     PrevoteQC(u64),
@@ -101,7 +102,7 @@ pub enum FromWhere {
 /// SMR event that state and timer monitor this.
 /// **NOTICE**: The `height` field is just for the timer. Timer will take this to signal the timer
 /// height. State will ignore this field on handling event.
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SMREvent {
     /// New round event,
     /// for state: update round,
@@ -115,6 +116,7 @@ pub enum SMREvent {
         from_where:    FromWhere,
         new_interval:  Option<u64>,
         new_config:    Option<DurationConfig>,
+        rr_vc:         Option<VectorClock>,
     },
 
     /// Prevote event,
@@ -126,6 +128,7 @@ pub enum SMREvent {
         round:      u64,
         block_hash: Hash,
         lock_round: Option<u64>,
+        rr_vc:      Option<VectorClock>,
     },
 
     /// Precommit event,
@@ -137,12 +140,13 @@ pub enum SMREvent {
         round:      u64,
         block_hash: Hash,
         lock_round: Option<u64>,
+        rr_vc:      Option<VectorClock>,
     },
     /// Commit event,
     /// for state: do commit,
     /// for timer: do nothing.
     #[display(fmt = "Commit event")]
-    Commit(Hash),
+    Commit(Hash, Option<VectorClock>),
 
     /// Brake event,
     /// for state: broadcast Choke message,
@@ -152,6 +156,7 @@ pub enum SMREvent {
         height:     u64,
         round:      u64,
         lock_round: Option<u64>,
+        rr_vc:      Option<VectorClock>,
     },
 
     /// Stop event,
@@ -161,8 +166,32 @@ pub enum SMREvent {
     Stop,
 }
 
+impl SMREvent {
+    pub fn get_vc(&self) -> Option<VectorClock> {
+        match self {
+            SMREvent::NewRoundInfo { rr_vc, .. } => rr_vc.clone(),
+            SMREvent::PrevoteVote { rr_vc, .. } => rr_vc.clone(),
+            SMREvent::PrecommitVote { rr_vc, .. } => rr_vc.clone(),
+            SMREvent::Commit(_, rr_vc) => rr_vc.clone(),
+            SMREvent::Brake { rr_vc, .. } => rr_vc.clone(),
+            SMREvent::Stop => Some(VectorClock::default()),
+        }
+    }
+
+    pub fn set_vc(&mut self, vc: VectorClock) {
+        match self {
+            SMREvent::NewRoundInfo { ref mut rr_vc, .. } => *rr_vc = Some(vc),
+            SMREvent::PrevoteVote { ref mut rr_vc, .. } => *rr_vc = Some(vc),
+            SMREvent::PrecommitVote { ref mut rr_vc, .. } => *rr_vc = Some(vc),
+            SMREvent::Commit(_, ref mut rr_vc) => *rr_vc = Some(vc),
+            SMREvent::Brake { ref mut rr_vc, .. } => *rr_vc = Some(vc),
+            SMREvent::Stop => {}
+        };
+    }
+}
+
 /// SMR trigger types.
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TriggerType {
     /// Proposal trigger.
     #[display(fmt = "Proposal")]
@@ -239,7 +268,7 @@ impl From<u8> for TriggerType {
 ///     * `round`: This must be `None`.
 /// For each sources, while filling the `SMRTrigger`, the `height` field take the current height
 /// directly.
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 #[display(
     fmt = "{:?} trigger from {:?}, height {}",
     trigger_type,
@@ -260,10 +289,13 @@ pub struct SMRTrigger {
     pub height: u64,
     ///
     pub wal_info: Option<SMRBase>,
+
+    // pub vc: Option<VectorClock>,
+    pub rr_vc: Option<VectorClock>,
 }
 
 /// An inner lock struct.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lock {
     /// Lock round.
     pub round: u64,
@@ -272,7 +304,7 @@ pub struct Lock {
 }
 
 /// SMR new status.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SMRStatus {
     /// New height.
     pub height: u64,

@@ -4,6 +4,7 @@ use bytes::Bytes;
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
+use crate::record::VectorClock;
 use crate::smr::smr_types::{SMRStatus, Step, TriggerType};
 use crate::{Codec, DurationConfig};
 
@@ -99,7 +100,7 @@ impl From<u8> for VoteType {
 
 /// Overlord messages.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverlordMsg<T: Codec> {
     /// Signed proposal message.
     #[display(fmt = "Signed Proposal")]
@@ -146,7 +147,7 @@ pub enum UpdateFrom {
 }
 
 /// A signed proposal.
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 #[display(fmt = "Signed Proposal {:?}", proposal)]
 pub struct SignedProposal<T: Codec> {
     /// Signature of the proposal.
@@ -156,7 +157,7 @@ pub struct SignedProposal<T: Codec> {
 }
 
 /// A proposal
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 #[display(fmt = "Proposal height {}, round {}", height, round)]
 pub struct Proposal<T: Codec> {
     /// Height of the proposal.
@@ -174,7 +175,7 @@ pub struct Proposal<T: Codec> {
 }
 
 /// A PoLC.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoLC {
     /// Lock round of the proposal.
     pub lock_round: u64,
@@ -183,7 +184,7 @@ pub struct PoLC {
 }
 
 /// A signed vote.
-#[derive(Clone, Debug, Display, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[display(fmt = "Signed vote {:?}", vote)]
 pub struct SignedVote {
     /// Signature of the vote.
@@ -240,7 +241,7 @@ pub struct AggregatedSignature {
 }
 
 /// An aggregated vote.
-#[derive(Serialize, Deserialize, Clone, Debug, Display, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Display, PartialEq, Eq, Hash )]
 #[rustfmt::skip]
 #[display(fmt = "{:?} aggregated vote height {}, round {}", vote_type, height, round)]
 pub struct AggregatedVote {
@@ -288,7 +289,7 @@ impl AggregatedVote {
 }
 
 /// A vote.
-#[derive(Clone, Debug, Display, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[display(fmt = "{:?} vote height {}, round {}", vote_type, height, round)]
 pub struct Vote {
     /// Height of the vote.
@@ -327,7 +328,7 @@ pub struct Proof {
 }
 
 /// A rich status.
-#[derive(Clone, Debug, Display, PartialEq, Eq)]
+#[derive(Clone, Debug, Display, PartialEq, Eq, Serialize, Deserialize)]
 #[display(fmt = "Rich status height {}", height)]
 pub struct Status {
     /// New height.
@@ -406,8 +407,8 @@ impl Node {
 }
 
 /// A verify response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct VerifyResp {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyResp {
     /// The height of the verified block.
     pub(crate) height: u64,
     /// The round of the verified block.
@@ -416,6 +417,8 @@ pub(crate) struct VerifyResp {
     pub(crate) block_hash: Hash,
     /// The block is pass or not.
     pub(crate) is_pass: bool,
+    /// rr
+    pub rr_vc: Option<VectorClock>,
 }
 
 /// An aggregated choke.
@@ -448,7 +451,7 @@ impl AggregatedChoke {
 }
 
 /// A signed choke.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedChoke {
     /// The signature of the choke.
     pub signature: Signature,
@@ -459,7 +462,7 @@ pub struct SignedChoke {
 }
 
 /// A choke.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choke {
     /// The height of the choke.
     pub height: u64,

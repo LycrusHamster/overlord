@@ -13,6 +13,7 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::stream::{FusedStream, Stream, StreamExt};
 use log::error;
 
+use crate::record::RRConfig;
 use crate::smr::smr_types::{SMREvent, SMRStatus, SMRTrigger, TriggerSource, TriggerType};
 use crate::smr::state_machine::StateMachine;
 use crate::types::Hash;
@@ -26,10 +27,10 @@ pub struct SMR {
 }
 
 impl SMR {
-    pub fn new() -> (Self, Event, Event) {
+    pub fn new(rr_config: RRConfig) -> (Self, Event, Event) {
         let (tx, rx) = unbounded();
         let smr = SMRHandler::new(tx);
-        let (state_machine, evt_state, evt_timer) = StateMachine::new(rx);
+        let (state_machine, evt_state, evt_timer) = StateMachine::new(rx, rr_config);
 
         let provider = SMR {
             smr_handler: Some(smr),
@@ -47,16 +48,7 @@ impl SMR {
 
     /// Run SMR module in tokio environment.
     pub fn run(mut self) {
-        tokio::spawn(async move {
-            loop {
-                let res = self.state_machine.next().await;
-                if let Some(Err(err)) = res {
-                    error!("Overlord: SMR error {:?}", err);
-                } else if res.is_none() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(async move { self.state_machine.run().await });
     }
 }
 
@@ -80,21 +72,20 @@ impl SMRHandler {
             .map_err(|_| ConsensusError::TriggerSMRErr(trigger_type))
     }
 
-    /// Trigger SMR to goto a new height.
-    pub fn new_height_status(&mut self, status: SMRStatus) -> ConsensusResult<()> {
-        let height = status.height;
-        let trigger = TriggerType::NewHeight(status);
-        self.tx
-            .unbounded_send(SMRTrigger {
-                trigger_type: trigger.clone(),
-                source: TriggerSource::State,
-                hash: Hash::new(),
-                round: None,
-                height,
-                wal_info: None,
-            })
-            .map_err(|_| ConsensusError::TriggerSMRErr(trigger.to_string()))
-    }
+    // pub fn new_height_status(&mut self, status: SMRStatus) -> ConsensusResult<()> {
+    //     let height = status.height;
+    //     let trigger = TriggerType::NewHeight(status);
+    //     self.tx
+    //         .unbounded_send(SMRTrigger {
+    //             trigger_type: trigger.clone(),
+    //             source: TriggerSource::State,
+    //             hash: Hash::new(),
+    //             round: None,
+    //             height,
+    //             wal_info: None,
+    //         })
+    //         .map_err(|_| ConsensusError::TriggerSMRErr(trigger.to_string()))
+    // }
 }
 
 ///

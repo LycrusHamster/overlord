@@ -54,7 +54,7 @@ impl<T: Codec> WalLock<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SMRBase {
     pub height: u64,
     pub round:  u64,

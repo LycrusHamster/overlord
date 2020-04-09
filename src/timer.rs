@@ -9,6 +9,8 @@ use futures::{FutureExt, SinkExt};
 use futures_timer::Delay;
 use log::{debug, error, info};
 
+use crate::record::RRData::VECT;
+use crate::record::{RRConfig, RRData, TaskLock, VectorClock};
 use crate::smr::smr_types::{SMREvent, SMRTrigger, TriggerSource, TriggerType};
 use crate::smr::{Event, SMRHandler};
 use crate::DurationConfig;
@@ -28,73 +30,85 @@ pub struct Timer {
     state_machine: SMRHandler,
     height:        u64,
     round:         u64,
+    rr:            TaskLock,
+}
+
+pub enum ReturnType {
+    EventFromSMR(SMREvent),
+    EventFromTimeout(SMREvent),
+    Error(),
 }
 
 ///
 impl Stream for Timer {
-    type Item = ConsensusError;
+    type Item = ReturnType;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        const SOURCE_EVENT: usize = 0usize;
+        const SOURCE_TIMEOUT: usize = 1usize;
+
         let mut event_ready = true;
         let mut timer_ready = true;
 
-        loop {
-            match self.event.poll_next_unpin(cx) {
-                Poll::Pending => event_ready = false,
+        match self.event.poll_next_unpin(cx) {
+            Poll::Pending => {}
 
-                Poll::Ready(event) => {
-                    if event.is_none() {
-                        return Poll::Ready(Some(ConsensusError::TimerErr(
-                            "Channel dropped".to_string(),
-                        )));
-                    }
+            Poll::Ready(event) => {
+                // log::info!("timer1 polls, event : {:?}", event);
 
-                    let event = event.unwrap();
-                    if event == SMREvent::Stop {
-                        return Poll::Ready(None);
-                    }
-                    if let Err(e) = self.set_timer(event) {
-                        return Poll::Ready(Some(e));
-                    }
+                if event.is_none() {
+                    log::error!("timer.event drops");
+                    return Poll::Ready(Some(ReturnType::Error()));
                 }
-            };
 
-            match self.notify.poll_next_unpin(cx) {
-                Poll::Pending => timer_ready = false,
-
-                Poll::Ready(event) => {
-                    if event.is_none() {
-                        return Poll::Ready(Some(ConsensusError::TimerErr(
-                            "Channel terminated".to_string(),
-                        )));
-                    }
-
-                    let event = event.unwrap();
-                    if let Err(e) = self.trigger(event) {
-                        return Poll::Ready(Some(e));
-                    }
+                let event = event.unwrap();
+                if event == SMREvent::Stop {
+                    return Poll::Ready(None);
                 }
+
+                return Poll::Ready(Some(ReturnType::EventFromSMR(event)));
             }
-            if !event_ready && !timer_ready {
-                return Poll::Pending;
+        };
+
+        match self.notify.poll_next_unpin(cx) {
+            Poll::Pending => {}
+
+            Poll::Ready(event) => {
+                // log::info!("timer2 polls, event : {:?}", event);
+
+                if event.is_none() {
+                    log::error!("timer.notify drops");
+                    return Poll::Ready(Some(ReturnType::Error()));
+                }
+
+                let event = event.unwrap();
+
+                return Poll::Ready(Some(ReturnType::EventFromTimeout(event)));
             }
         }
+
+        return Poll::Pending;
     }
 }
 
 impl Timer {
+    const SOURCE_EVENT: usize = 0usize;
+    const SOURCE_TIMEOUT: usize = 1usize;
+
     pub fn new(
         event: Event,
         state_machine: SMRHandler,
         interval: u64,
         config: Option<DurationConfig>,
+        rr_config: RRConfig,
     ) -> Self {
         let (tx, rx) = unbounded();
         let mut timer_config = TimerConfig::new(interval);
         if let Some(tmp) = config {
             timer_config.update(tmp);
         }
-
+        let mut rr_config = rr_config.clone();
+        rr_config.trace_path.push("timer.rr");
         Timer {
             config: timer_config,
             height: INIT_HEIGHT,
@@ -103,19 +117,107 @@ impl Timer {
             notify: rx,
             event,
             state_machine,
+            rr: TaskLock::new(3usize, "Timer".to_string(), rr_config),
         }
     }
 
     pub fn run(mut self) {
         tokio::spawn(async move {
-            while let Some(err) = self.next().await {
-                error!("Overlord: timer error {:?}", err);
+            loop {
+                let res = self.next().await;
+
+                if res.is_none() {
+                    log::error!("timer channel ends");
+                    break;
+                }
+
+                if let Some(return_data) = res {
+                    if self.rr.on_record() || self.rr.on_inactivated() {
+                        self.run_inactivated_on_record(return_data);
+                    } else {
+                        self.run_on_replay(return_data);
+                    }
+                }
             }
         });
     }
 
-    fn set_timer(&mut self, event: SMREvent) -> ConsensusResult<()> {
+    pub fn run_inactivated_on_record(&mut self, return_data: ReturnType) {
+        match return_data {
+            ReturnType::EventFromSMR(event) => {
+                self.set_timer(event);
+            }
+            ReturnType::EventFromTimeout(event) => {
+                self.trigger(event);
+            }
+            ReturnType::Error() => {
+                log::error!("timer polling get error");
+            }
+        };
+    }
+
+    pub fn run_on_replay(&mut self, return_data: ReturnType) {
+        match return_data {
+            ReturnType::EventFromSMR(event) => {
+                let rr_data =
+                    RRData::from_vector(Self::SOURCE_EVENT, event.clone().get_vc().unwrap());
+                self.rr.supply(rr_data.clone());
+                self.rr
+                    .save_vc_data(rr_data, serde_json::to_string(&event).unwrap());
+            }
+            ReturnType::EventFromTimeout(event) => {
+                let rr_data =
+                    RRData::from_vector(Self::SOURCE_TIMEOUT, event.clone().get_vc().unwrap());
+                self.rr.supply(rr_data.clone());
+                self.rr
+                    .save_vc_data(rr_data, serde_json::to_string(&event).unwrap());
+            }
+            ReturnType::Error() => log::error!("timer polling get error"),
+        };
+
+        while let Some(rr_data) = self.rr.next() {
+            let source = rr_data.get_source();
+            if source == Self::SOURCE_EVENT {
+                if let RRData::VECT {
+                    source,
+                    received_vc,
+                } = rr_data.clone()
+                {
+                    let data: SMREvent =
+                        serde_json::from_str(self.rr.extract_vc_data(rr_data).as_str()).unwrap();
+
+                    self.set_timer(data);
+                }
+            } else if source == Self::SOURCE_TIMEOUT {
+                if let RRData::VECT {
+                    source,
+                    received_vc,
+                } = rr_data.clone()
+                {
+                    let data: SMREvent =
+                        serde_json::from_str(self.rr.extract_vc_data(rr_data).as_str()).unwrap();
+
+                    self.trigger(data);
+                }
+            }
+        }
+    }
+
+    fn set_timer(&mut self, mut event: SMREvent) -> ConsensusResult<()> {
         let mut is_brake_timer = false;
+        log::warn!("timer.set_timer SMREvent: {:?}", event);
+
+        if self.rr.on_record() || self.rr.on_replay() {
+            let vc = event.clone().get_vc();
+
+            let vc = vc.unwrap();
+
+            self.rr.receive(
+                RRData::from_vector(Self::SOURCE_EVENT, vc),
+                "timer, get smr event from smr".to_string(),
+            );
+        }
+
         match event.clone() {
             SMREvent::NewRoundInfo {
                 height,
@@ -137,7 +239,7 @@ impl Timer {
                 }
             }
             SMREvent::Brake { .. } => is_brake_timer = true,
-            SMREvent::Commit(_) => return Ok(()),
+            SMREvent::Commit(_, _) => return Ok(()),
             _ => (),
         };
 
@@ -150,7 +252,14 @@ impl Timer {
             interval *= 2u32.pow(coef);
         }
 
-        info!("Overlord: timer set {:?} timer", event);
+        if self.rr.on_record() || self.rr.on_replay() {
+            let vc = self
+                .rr
+                .send("timer polls, send timeout to self".to_string());
+            event.set_vc(vc);
+        }
+
+        info!("Overlord: timer set timer, {:?}", event);
         let smr_timer = TimeoutInfo::new(interval, event, self.sender.clone());
 
         tokio::spawn(async move {
@@ -161,6 +270,19 @@ impl Timer {
 
     #[rustfmt::skip]
     fn trigger(&mut self, event: SMREvent) -> ConsensusResult<()> {
+        log::warn!("timer.trigger SMREvent: {:?}",event);
+
+        if self.rr.on_record() || self.rr.on_replay() {
+            let vc = event.clone().get_vc();
+
+            let vc = vc.unwrap();
+
+            self.rr.receive(
+                RRData::from_vector(Self::SOURCE_TIMEOUT, vc),
+                "timer, get timeout".to_string(),
+            );
+        }
+
         let (trigger_type, round, height) = match event {
             SMREvent::NewRoundInfo { height, round, .. } => {
                 if height < self.height || round < self.round {
@@ -187,7 +309,7 @@ impl Timer {
                 (TriggerType::PrecommitQC, Some(round), height)
             }
 
-            SMREvent::Brake {height, round, ..} => {
+            SMREvent::Brake { height, round, .. } => {
                 if height < self.height {
                     return Ok(());
                 }
@@ -198,7 +320,14 @@ impl Timer {
         };
 
         debug!("Overlord: timer {:?} time out", event);
+        let mut vc = None;
 
+        if self.rr.on_record() || self.rr.on_replay(){
+            vc = Some(self.rr.send("timer polls, send trigger to state".to_string()));
+
+        }
+
+        log::info!("timer send trigger to smr : {}", trigger_type.clone());
         self.state_machine.trigger(SMRTrigger {
             source: TriggerSource::Timer,
             hash: Hash::new(),
@@ -206,7 +335,9 @@ impl Timer {
             round,
             height,
             wal_info: None,
+            rr_vc: vc,
         })
+
     }
 }
 
@@ -230,9 +361,17 @@ impl Future for TimeoutInfo {
         match self.timeout.poll_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(_) => {
-                tokio::spawn(async move {
-                    let _ = tx.send(msg).await;
-                });
+                // tokio::spawn(async move {
+                // tx.send(msg).await;
+                // });
+                // log::info!("TimeoutInfo poll: {:?}", msg);
+                log::info!("TimeoutInfo sends event to Timer: {:?}", msg);
+                tx.unbounded_send(msg);
+
+                // tokio::spawn(async move {
+                //     let _ = tx.send(msg).await;
+                // });
+
                 Poll::Ready(())
             }
         }
@@ -254,6 +393,7 @@ mod test {
     use futures::channel::mpsc::unbounded;
     use futures::stream::StreamExt;
 
+    use crate::record::RRConfig;
     use crate::smr::smr_types::{FromWhere, SMREvent, SMRTrigger, TriggerSource, TriggerType};
     use crate::smr::{Event, SMRHandler};
     use crate::{timer::Timer, types::Hash};
@@ -266,6 +406,7 @@ mod test {
             SMRHandler::new(trigger_tx),
             3000,
             None,
+            RRConfig::default(),
         );
         event_tx.unbounded_send(input).unwrap();
 
@@ -292,6 +433,7 @@ mod test {
             round,
             height,
             wal_info: None,
+            rr_vc: None,
         }
     }
 
@@ -307,6 +449,7 @@ mod test {
                 new_interval:  None,
                 new_config:    None,
                 from_where:    FromWhere::PrecommitQC(0),
+                rr_vc:         None,
             },
             gen_output(TriggerType::Proposal, None, 0),
         )
@@ -319,6 +462,7 @@ mod test {
                 round:      0u64,
                 block_hash: Hash::new(),
                 lock_round: None,
+                rr_vc:      None,
             },
             gen_output(TriggerType::PrevoteQC, Some(0), 0),
         )
@@ -331,6 +475,7 @@ mod test {
                 round:      0u64,
                 block_hash: Hash::new(),
                 lock_round: None,
+                rr_vc:      None,
             },
             gen_output(TriggerType::PrecommitQC, Some(0), 0),
         )
@@ -346,6 +491,7 @@ mod test {
             SMRHandler::new(trigger_tx),
             3000,
             None,
+            RRConfig::default(),
         );
 
         let new_round_event = SMREvent::NewRoundInfo {
@@ -356,6 +502,7 @@ mod test {
             new_interval:  None,
             new_config:    None,
             from_where:    FromWhere::PrecommitQC(0),
+            rr_vc:         None,
         };
 
         let prevote_event = SMREvent::PrevoteVote {
@@ -363,6 +510,7 @@ mod test {
             round:      0u64,
             block_hash: Hash::new(),
             lock_round: None,
+            rr_vc:      None,
         };
 
         let precommit_event = SMREvent::PrecommitVote {
@@ -370,6 +518,7 @@ mod test {
             round:      0u64,
             block_hash: Hash::new(),
             lock_round: None,
+            rr_vc:      None,
         };
 
         tokio::spawn(async move {

@@ -3,10 +3,11 @@ use std::task::{Context, Poll};
 
 use derive_more::Display;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use log::{debug, info};
 use moodyblues_sdk::trace;
 
+use crate::record::{RRConfig, RRData, TaskLock};
 use crate::smr::smr_types::{
     FromWhere, Lock, SMREvent, SMRStatus, SMRTrigger, Step, TriggerSource, TriggerType,
 };
@@ -19,61 +20,34 @@ use crate::{ConsensusResult, INIT_HEIGHT, INIT_ROUND};
 #[rustfmt::skip]
 #[display(fmt = "State machine height {}, round {}, step {:?}", height, round, step)]
 pub struct StateMachine {
-    height:      u64,
-    round:         u64,
-    step:          Step,
-    block_hash:    Hash,
-    lock:          Option<Lock>,
+    height: u64,
+    round: u64,
+    step: Step,
+    block_hash: Hash,
+    lock: Option<Lock>,
 
-    event:   (UnboundedSender<SMREvent>, UnboundedSender<SMREvent>),
+    event: (UnboundedSender<SMREvent>, UnboundedSender<SMREvent>),
     trigger: UnboundedReceiver<SMRTrigger>,
+
+    rr: TaskLock,
 }
 
 impl Stream for StateMachine {
-    type Item = ConsensusResult<()>;
+    type Item = SMRTrigger;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         match Stream::poll_next(Pin::new(&mut self.trigger), cx) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => return Poll::Pending,
 
             Poll::Ready(msg) => {
+                log::info!("smr, polls, trigger : {:?}", msg);
                 if msg.is_none() {
-                    return Poll::Ready(Some(Err(ConsensusError::TriggerSMRErr(
-                        "Channel dropped".to_string(),
-                    ))));
+                    return Poll::Ready(None);
                 }
 
                 let msg = msg.unwrap();
-                let trigger_type = msg.trigger_type.clone();
-                let res = match trigger_type {
-                    TriggerType::NewHeight(status) => {
-                        Some(self.handle_new_height(status, msg.source))
-                    }
-                    TriggerType::Proposal => {
-                        Some(self.handle_proposal(msg.hash, msg.round, msg.source, msg.height))
-                    }
-                    TriggerType::PrevoteQC => {
-                        Some(self.handle_prevote(msg.hash, msg.round, msg.source, msg.height))
-                    }
-                    TriggerType::PrecommitQC => {
-                        Some(self.handle_precommit(msg.hash, msg.round, msg.source, msg.height))
-                    }
-                    TriggerType::BrakeTimeout => {
-                        assert!(msg.source == TriggerSource::Timer);
-                        Some(self.handle_brake_timeout(msg.height, msg.round))
-                    }
-                    TriggerType::ContinueRound => {
-                        assert!(msg.source == TriggerSource::State);
-                        Some(self.handle_continue_round(msg.height, msg.round))
-                    }
-                    TriggerType::WalInfo => Some(self.handle_wal(msg.wal_info.unwrap())),
-                    TriggerType::Stop => {
-                        let _ = self.throw_event(SMREvent::Stop);
-                        None
-                    }
-                };
 
-                Poll::Ready(res)
+                return Poll::Ready(Some(msg));
             }
         }
     }
@@ -81,10 +55,14 @@ impl Stream for StateMachine {
 
 impl StateMachine {
     /// Create a new state machine.
-    pub fn new(trigger_receiver: UnboundedReceiver<SMRTrigger>) -> (Self, Event, Event) {
+    pub fn new(
+        trigger_receiver: UnboundedReceiver<SMRTrigger>,
+        rr_config: RRConfig,
+    ) -> (Self, Event, Event) {
         let (tx_state, rx_state) = unbounded();
         let (tx_timer, rx_timer) = unbounded();
-
+        let mut rr_config = rr_config.clone();
+        rr_config.trace_path.push("smr.rr");
         let state_machine = StateMachine {
             height:     INIT_HEIGHT,
             round:      INIT_ROUND,
@@ -93,9 +71,93 @@ impl StateMachine {
             lock:       None,
             trigger:    trigger_receiver,
             event:      (tx_state, tx_timer),
+            rr:         TaskLock::new(1usize, "SMR".to_string(), rr_config),
         };
 
         (state_machine, Event::new(rx_state), Event::new(rx_timer))
+    }
+
+    pub async fn run(mut self) {
+        while let Some(smr_trigger) = self.next().await {
+            if self.rr.on_record() || self.rr.on_inactivated() {
+                self.run_inactivated_on_record(smr_trigger);
+            } else {
+                self.run_on_replay(smr_trigger);
+            }
+        }
+
+        log::error!("Overlord: SMR drop");
+    }
+
+    pub fn run_inactivated_on_record(&mut self, smr_trigger: SMRTrigger) {
+        let smr_trigger = smr_trigger.clone();
+
+        self.handle(smr_trigger);
+    }
+
+    pub fn run_on_replay(&mut self, smr_trigger: SMRTrigger) {
+        let smr_trigger = smr_trigger.clone();
+        let rr_data = RRData::from_vector(0usize, smr_trigger.rr_vc.clone().unwrap());
+        self.rr.supply(rr_data.clone());
+
+        self.rr
+            .save_vc_data(rr_data, serde_json::to_string(&smr_trigger).unwrap());
+
+        while let Some(rr_data) = self.rr.next() {
+            let source = rr_data.get_source();
+
+            if let RRData::VECT {
+                source,
+                received_vc,
+            } = rr_data.clone()
+            {
+                let msg = self.rr.extract_vc_data(rr_data);
+                let msg: SMRTrigger = serde_json::from_str(msg.as_str()).unwrap();
+
+                self.handle(msg);
+            }
+        }
+    }
+
+    fn handle(&mut self, msg: SMRTrigger) -> Option<ConsensusResult<()>> {
+        let trigger_type = msg.trigger_type.clone();
+
+        log::warn!("smr handle {}", trigger_type.clone());
+
+        if self.rr.on_record() || self.rr.on_replay() {
+            self.rr.receive(
+                RRData::from_vector(0usize, msg.clone().rr_vc.unwrap()),
+                "stat_machine polls, get trigger".to_string(),
+            );
+        }
+
+        let res = match trigger_type {
+            TriggerType::NewHeight(status) => Some(self.handle_new_height(status, msg.source)),
+            TriggerType::Proposal => {
+                Some(self.handle_proposal(msg.hash, msg.round, msg.source, msg.height))
+            }
+            TriggerType::PrevoteQC => {
+                Some(self.handle_prevote(msg.hash, msg.round, msg.source, msg.height))
+            }
+            TriggerType::PrecommitQC => {
+                Some(self.handle_precommit(msg.hash, msg.round, msg.source, msg.height))
+            }
+            TriggerType::BrakeTimeout => {
+                assert!(msg.source == TriggerSource::Timer);
+                Some(self.handle_brake_timeout(msg.height, msg.round))
+            }
+            TriggerType::ContinueRound => {
+                assert!(msg.source == TriggerSource::State);
+                Some(self.handle_continue_round(msg.height, msg.round))
+            }
+            TriggerType::WalInfo => Some(self.handle_wal(msg.wal_info.unwrap())),
+            TriggerType::Stop => {
+                let _ = self.throw_event(SMREvent::Stop);
+                None
+            }
+        };
+
+        res
     }
 
     fn handle_brake_timeout(&mut self, height: u64, round: Option<u64>) -> ConsensusResult<()> {
@@ -112,6 +174,7 @@ impl StateMachine {
                 height,
                 round,
                 lock_round: self.lock.clone().map(|lock| lock.round),
+                rr_vc: None,
             })
         }
     }
@@ -138,6 +201,7 @@ impl StateMachine {
             new_interval: None,
             new_config: None,
             from_where: FromWhere::ChokeQC(round - 1),
+            rr_vc: None,
         })?;
         self.goto_next_round();
         Ok(())
@@ -181,6 +245,7 @@ impl StateMachine {
             new_interval:  status.new_interval,
             new_config:    status.new_config,
             from_where:    FromWhere::PrecommitQC(u64::max_value()),
+            rr_vc:         None,
         })?;
         Ok(())
     }
@@ -226,6 +291,7 @@ impl StateMachine {
                 round:      self.round,
                 block_hash: hash,
                 lock_round: round,
+                rr_vc:      None,
             })?;
             self.goto_step(Step::Prevote);
             return Ok(());
@@ -264,6 +330,7 @@ impl StateMachine {
             round:      self.round,
             block_hash: self.block_hash.clone(),
             lock_round: round,
+            rr_vc:      None,
         })?;
         self.goto_step(Step::Prevote);
         Ok(())
@@ -317,6 +384,7 @@ impl StateMachine {
                 round:      self.round,
                 block_hash: Hash::new(),
                 lock_round: round,
+                rr_vc:      None,
             })?;
             self.goto_step(Step::Precommit);
             return Ok(());
@@ -344,6 +412,7 @@ impl StateMachine {
                 new_interval: None,
                 new_config: None,
                 from_where: FromWhere::PrevoteQC(vote_round),
+                rr_vc: None,
             })?;
             self.goto_next_round();
         }
@@ -359,6 +428,7 @@ impl StateMachine {
             round:      self.round,
             block_hash: self.block_hash.clone(),
             lock_round: round,
+            rr_vc:      None,
         })?;
         self.goto_step(Step::Precommit);
         Ok(())
@@ -414,6 +484,7 @@ impl StateMachine {
                 height: self.height,
                 round: self.round,
                 lock_round,
+                rr_vc: None,
             });
         } else if precommit_hash.is_empty() {
             self.round = precommit_round;
@@ -425,6 +496,7 @@ impl StateMachine {
                 new_interval: None,
                 new_config: None,
                 from_where: FromWhere::PrecommitQC(precommit_round),
+                rr_vc: None,
             })?;
 
             self.goto_next_round();
@@ -432,23 +504,34 @@ impl StateMachine {
         }
 
         self.check()?;
-        self.throw_event(SMREvent::Commit(precommit_hash))?;
+        self.throw_event(SMREvent::Commit(precommit_hash, None))?;
         self.goto_step(Step::Commit);
         Ok(())
     }
 
-    fn throw_event(&mut self, event: SMREvent) -> ConsensusResult<()> {
+    fn throw_event(&mut self, mut event: SMREvent) -> ConsensusResult<()> {
         info!("Overlord: SMR throw {:?} event", event);
+        if self.rr.on_record() || self.rr.on_replay() {
+            let vc = self.rr.send("send event to state and timer".to_string());
+            event.set_vc(vc);
+        }
+
         self.event.0.unbounded_send(event.clone()).map_err(|err| {
             ConsensusError::ThrowEventErr(format!("event: {}, error: {:?}", event.clone(), err))
         })?;
+
         self.event.1.unbounded_send(event.clone()).map_err(|err| {
             ConsensusError::ThrowEventErr(format!("event: {}, error: {:?}", event.clone(), err))
         })?;
         Ok(())
     }
 
-    fn throw_timer_event(&mut self, event: SMREvent) -> ConsensusResult<()> {
+    fn throw_timer_event(&mut self, mut event: SMREvent) -> ConsensusResult<()> {
+        if self.rr.on_record() || self.rr.on_replay() {
+            let vc = self.rr.send("send event to timer".to_string());
+            event.set_vc(vc);
+        }
+
         self.event.1.unbounded_send(event.clone()).map_err(|err| {
             ConsensusError::ThrowEventErr(format!("event: {}, error: {:?}", event.clone(), err))
         })?;
@@ -489,23 +572,27 @@ impl StateMachine {
                 new_interval: None,
                 new_config: None,
                 from_where: FromWhere::PrecommitQC(u64::max_value()),
+                rr_vc: None,
             },
             Step::Prevote => SMREvent::PrevoteVote {
                 height: self.height,
                 round: self.round,
                 block_hash: Hash::new(),
                 lock_round,
+                rr_vc: None,
             },
             Step::Precommit => SMREvent::PrecommitVote {
                 height: self.height,
                 round: self.round,
                 block_hash: Hash::new(),
                 lock_round,
+                rr_vc: None,
             },
             Step::Brake => SMREvent::Brake {
                 height: self.height,
                 round: self.round,
                 lock_round,
+                rr_vc: None,
             },
             _ => unreachable!(),
         };

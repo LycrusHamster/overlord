@@ -9,7 +9,7 @@ use bytes::Bytes;
 use creep::Context;
 use derive_more::Display;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures::{select, StreamExt};
+use futures::{select, Stream, StreamExt};
 use futures_timer::Delay;
 use log::{debug, error, info, warn};
 use moodyblues_sdk::trace;
@@ -17,9 +17,14 @@ use rlp::encode;
 use serde_json::json;
 
 use crate::error::ConsensusError;
-use crate::smr::smr_types::{FromWhere, SMREvent, SMRTrigger, Step, TriggerSource, TriggerType};
+use crate::record::RRData::{JSON, VECT};
+use crate::record::{RRConfig, RRData, TaskLock, VectorClock};
+use crate::smr::smr_types::{
+    FromWhere, SMREvent, SMRStatus, SMRTrigger, Step, TriggerSource, TriggerType,
+};
 use crate::smr::{Event, SMRHandler};
 use crate::state::collection::{ChokeCollector, ProposalCollector, VoteCollector};
+use crate::state::verifier::VerifyReq;
 use crate::types::{
     Address, AggregatedChoke, AggregatedSignature, AggregatedVote, Choke, Commit, Hash, Node,
     OverlordMsg, PoLC, Proof, Proposal, Signature, SignedChoke, SignedProposal, SignedVote, Status,
@@ -28,6 +33,11 @@ use crate::types::{
 use crate::utils::auth_manage::AuthorityManage;
 use crate::wal::{WalInfo, WalLock};
 use crate::{Codec, Consensus, ConsensusResult, Crypto, Wal, INIT_HEIGHT, INIT_ROUND};
+use futures::task::Poll;
+use parking_lot::RwLock;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::pin::Pin;
 
 const FUTURE_HEIGHT_GAP: u64 = 5;
 const FUTURE_ROUND_GAP: u64 = 10;
@@ -47,7 +57,12 @@ enum MsgType {
 /// round. The `votes` field saves all signed votes and quorum certificates which height is higher
 /// than `current_height - 1`.
 #[derive(Debug)]
-pub struct State<T: Codec, F: Consensus<T>, C: Crypto, W: Wal> {
+pub struct State<
+    T: Codec + Unpin + Serialize + DeserializeOwned,
+    F: Consensus<T>,
+    C: Crypto,
+    W: Wal,
+> {
     height:              u64,
     round:               u64,
     state_machine:       SMRHandler,
@@ -66,19 +81,89 @@ pub struct State<T: Codec, F: Consensus<T>, C: Crypto, W: Wal> {
     consensus_power:     bool,
     stopped:             bool,
 
-    resp_tx:  UnboundedSender<VerifyResp>,
+    verify_req_tx:  UnboundedSender<VerifyReq<T>>,
+    verify_resp_rx: UnboundedReceiver<VerifyResp>,
+
+    overlord_msg_rx: UnboundedReceiver<(Context, OverlordMsg<T>)>,
+    event:           Event,
+
     function: Arc<F>,
     wal:      Arc<W>,
     util:     Arc<C>,
+
+    rr: TaskLock,
 }
 
-impl<T, F, C, W> State<T, F, C, W>
+pub enum ReturnType<T: Codec> {
+    OverlordMsg(Context, OverlordMsg<T>),
+    Event(SMREvent),
+    VerifyResp(VerifyResp),
+    Errors(),
+}
+
+impl<T, F, C, W> Stream for State<T, F, C, W>
 where
-    T: Codec + 'static,
+    T: Codec + Unpin + Serialize + DeserializeOwned + 'static,
     F: Consensus<T> + 'static,
     C: Crypto,
     W: Wal,
 {
+    type Item = ReturnType<T>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if let Poll::Ready(msg) = self.overlord_msg_rx.poll_next_unpin(cx) {
+            // log::info!("state polls, overlord msg : {:?}", msg);
+            if msg.is_none() {
+                return Poll::Ready(Some(ReturnType::Errors()));
+            };
+            let msg = msg.unwrap();
+            return Poll::Ready(Some(ReturnType::OverlordMsg(msg.0, msg.1)));
+        }
+
+        if let Poll::Ready(event) = self.event.poll_next_unpin(cx) {
+            // log::info!("state polls, event : {:?}", event);
+            if event.is_none() {
+                return Poll::Ready(Some(ReturnType::Errors()));
+            }
+
+            let event = event.unwrap();
+            if event == SMREvent::Stop {
+                return Poll::Ready(None);
+            }
+            return Poll::Ready(Some(ReturnType::Event(event)));
+        }
+
+        if let Poll::Ready(resp) = self.verify_resp_rx.poll_next_unpin(cx) {
+            // log::info!("state polls, verify resp, event : {:?}", resp);
+            if resp.is_none() {
+                return Poll::Ready(Some(ReturnType::Errors()));
+            }
+
+            let resp = resp.unwrap();
+
+            return Poll::Ready(Some(ReturnType::VerifyResp(resp)));
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T, F, C, W> State<T, F, C, W>
+where
+    T: Codec + Unpin + Serialize + DeserializeOwned + 'static,
+    F: Consensus<T> + 'static,
+    C: Crypto,
+    W: Wal,
+{
+    const SOURCE_EVENT: usize = 1usize;
+    const SOURCE_OVERLORD_MSG: usize = 0usize;
+    const SOURCE_UP_CALL_COMMIT: usize = 3usize;
+    const SOURCE_UP_CALL_GET_BLOCK: usize = 4usize;
+    const SOURCE_VERIFY_RESP: usize = 2usize;
+
     /// Create a new state struct.
     pub(crate) fn new(
         smr: SMRHandler,
@@ -88,79 +173,132 @@ where
         consensus: Arc<F>,
         crypto: Arc<C>,
         wal_engine: Arc<W>,
-    ) -> (Self, UnboundedReceiver<VerifyResp>) {
-        let (tx, rx) = unbounded();
+        rr_config: RRConfig,
+        req_tx: UnboundedSender<VerifyReq<T>>,
+        resp_rx: UnboundedReceiver<VerifyResp>,
+        raw_rx: UnboundedReceiver<(Context, OverlordMsg<T>)>,
+        event: Event,
+        //) -> (Self, UnboundedReceiver<VerifyResp>) {
+    ) -> Self {
+        // let (tx, rx) = unbounded();
         let mut auth = AuthorityManage::new();
         auth.update(&mut authority_list);
 
-        let state = State {
-            height:              INIT_HEIGHT,
-            round:               INIT_ROUND,
-            state_machine:       smr,
-            address:             addr,
-            proposals:           ProposalCollector::new(),
-            votes:               VoteCollector::new(),
-            chokes:              ChokeCollector::new(),
-            authority:           auth,
-            hash_with_block:     HashMap::new(),
-            is_full_transcation: HashMap::new(),
-            is_leader:           false,
-            leader_address:      Address::default(),
-            update_from_where:   UpdateFrom::PrecommitQC(mock_init_qc()),
-            height_start:        Instant::now(),
-            block_interval:      interval,
-            consensus_power:     false,
-            stopped:             false,
+        let mut rr_config_state = rr_config.clone();
+        rr_config_state.trace_path.push("state.rr");
 
-            resp_tx:  tx,
+        let state = State {
+            height: INIT_HEIGHT,
+            round: INIT_ROUND,
+            state_machine: smr,
+            address: addr,
+            proposals: ProposalCollector::new(),
+            votes: VoteCollector::new(),
+            chokes: ChokeCollector::new(),
+            authority: auth,
+            hash_with_block: HashMap::new(),
+            is_full_transcation: HashMap::new(),
+            is_leader: false,
+            leader_address: Address::default(),
+            update_from_where: UpdateFrom::PrecommitQC(mock_init_qc()),
+            height_start: Instant::now(),
+            block_interval: interval,
+            consensus_power: false,
+            stopped: false,
+
+            verify_req_tx: req_tx,
+            verify_resp_rx: resp_rx,
+            overlord_msg_rx: raw_rx,
+            event,
+
             function: consensus,
-            util:     crypto,
-            wal:      wal_engine,
+            util: crypto,
+            wal: wal_engine,
+
+            rr: TaskLock::new(0usize, "State".to_string(), rr_config_state.clone()),
         };
 
-        (state, rx)
+        //(state, rx)
+        state
     }
 
-    /// Run state module.
-    pub(crate) async fn run(
-        &mut self,
-        mut raw_rx: UnboundedReceiver<(Context, OverlordMsg<T>)>,
-        mut event: Event,
-        mut verify_resp: UnboundedReceiver<VerifyResp>,
-    ) {
-        debug!("Overlord: state start running");
-        if let Err(e) = self.start_with_wal().await {
-            error!("Overlord: start with wal error {:?}", e);
+    pub async fn run(mut self) {
+        while let Some(return_data) = self.next().await {
+            if self.rr.on_record() || self.rr.on_inactivated() {
+                self.run_inactivated_on_record(return_data).await;
+            } else {
+                self.run_on_replay(return_data).await;
+            }
         }
+        log::error!("state poll get None, which means stream ends");
+    }
 
-        loop {
-            select! {
-                raw = raw_rx.next() => {
-                    if let Err(e) = self.handle_msg(raw).await {
-                        error!("Overlord: state {:?} error", e);
-                    }
+    pub async fn run_inactivated_on_record(&mut self, return_data: ReturnType<T>) {
+        match return_data {
+            ReturnType::OverlordMsg(ctx, overlord_msg) => {
+                self.handle_msg(Some((ctx, overlord_msg))).await;
+            }
+            ReturnType::Event(event) => {
+                self.handle_event(Some(event)).await;
+            }
+            ReturnType::VerifyResp(verify_resp) => {
+                self.handle_resp(Some(verify_resp));
+            }
+            ReturnType::Errors() => log::error!("state poll get error"),
+        }
+    }
+
+    pub async fn run_on_replay(&mut self, return_data: ReturnType<T>) {
+        match return_data {
+            ReturnType::OverlordMsg(ctx, overlord_msg) => {
+                // cause it's data feed, we ignore
+            }
+            ReturnType::Event(event) => {
+                let rr_data = RRData::from_vector(Self::SOURCE_EVENT, event.get_vc().unwrap());
+                self.rr.supply(rr_data.clone());
+                self.rr
+                    .save_vc_data(rr_data, serde_json::to_string(&event).unwrap());
+            }
+            ReturnType::VerifyResp(verify_resp) => {
+                let rr_data = RRData::from_vector(
+                    Self::SOURCE_VERIFY_RESP,
+                    verify_resp.clone().rr_vc.unwrap(),
+                );
+                self.rr.supply(rr_data.clone());
+                self.rr
+                    .save_vc_data(rr_data, serde_json::to_string(&verify_resp).unwrap());
+            }
+            ReturnType::Errors() => log::error!("state poll get error"),
+        };
+
+        while let Some(rr_data) = self.rr.next() {
+            let source = rr_data.get_source();
+            if source == Self::SOURCE_EVENT {
+                if let VECT {
+                    source,
+                    received_vc,
+                } = rr_data.clone()
+                {
+                    let data: SMREvent =
+                        serde_json::from_str(self.rr.extract_vc_data(rr_data).as_str()).unwrap();
+
+                    self.handle_event(Some(data)).await;
                 }
-                evt = event.next() => {
-                    if self.stopped {
-                        break;
-                    }
+            } else if source == Self::SOURCE_VERIFY_RESP {
+                if let VECT {
+                    source,
+                    received_vc,
+                } = rr_data.clone()
+                {
+                    let data: VerifyResp =
+                        serde_json::from_str(self.rr.extract_vc_data(rr_data).as_str()).unwrap();
 
-                    if !self.consensus_power {
-                        continue;
-                    }
-
-                    if let Err(e) = self.handle_event(evt).await{
-                        error!("Overlord: state {:?} error", e);
-                    }
+                    self.handle_resp(Some(data));
                 }
-                res = verify_resp.next() => {
-                    if !self.consensus_power {
-                        continue;
-                    }
-
-                    if let Err(e) = self.handle_resp(res) {
-                        error!("Overlord: state {:?} error", e);
-                    }
+            } else if source == Self::SOURCE_OVERLORD_MSG {
+                if let JSON { source, json } = rr_data {
+                    let data: OverlordMsg<T> = serde_json::from_str(json.as_str()).unwrap();
+                    self.handle_msg(Some((Context::new(), data))).await;
                 }
             }
         }
@@ -173,6 +311,17 @@ where
     ) -> ConsensusResult<()> {
         let msg = msg.ok_or_else(|| ConsensusError::Other("Message sender dropped".to_string()))?;
         let (ctx, raw) = (msg.0, msg.1);
+
+        if !self.rr.on_inactivated() {
+            self.rr.receive(
+                RRData::from_feed(
+                    Self::SOURCE_OVERLORD_MSG,
+                    // serde_json::to_string(&raw).unwrap(),
+                    serde_json::to_string(&raw).unwrap(),
+                ),
+                "state handle_msg".to_string(),
+            );
+        }
 
         if !self.consensus_power && !raw.is_rich_status() {
             return Ok(());
@@ -255,13 +404,14 @@ where
             }
 
             OverlordMsg::Stop => {
-                self.state_machine.trigger(SMRTrigger {
+                self.trigger_state_machine(SMRTrigger {
                     trigger_type: TriggerType::Stop,
                     source:       TriggerSource::State,
                     hash:         Hash::new(),
                     round:        Some(self.round),
                     height:       self.height,
                     wal_info:     None,
+                    rr_vc:        None,
                 })?;
                 self.stopped = true;
                 Ok(())
@@ -275,7 +425,19 @@ where
 
     /// A function to handle event from the SMR. Public this function in the crate to do unit tests.
     pub(crate) async fn handle_event(&mut self, event: Option<SMREvent>) -> ConsensusResult<()> {
-        match event.ok_or_else(|| ConsensusError::Other("Event sender dropped".to_string()))? {
+        let event =
+            event.ok_or_else(|| ConsensusError::Other("Event sender dropped".to_string()))?;
+
+        if !self.rr.on_inactivated() {
+            let vc = event.clone().get_vc().unwrap();
+
+            self.rr.receive(
+                RRData::from_vector(Self::SOURCE_EVENT, vc),
+                "state handle_event".to_string(),
+            );
+        }
+
+        match event {
             SMREvent::NewRoundInfo {
                 round,
                 lock_round,
@@ -295,7 +457,7 @@ where
                             "is lock": lock_round.is_some(),
                         })),
                     );
-                    error!("Overlord: state handle new round error {:?}", e);
+                    // error!("Overlord: state handle new round error {:?}", e);
                 }
                 Ok(())
             }
@@ -344,7 +506,7 @@ where
                 Ok(())
             }
 
-            SMREvent::Commit(hash) => {
+            SMREvent::Commit(hash, ..) => {
                 if let Err(e) = self.handle_commit(hash).await {
                     trace::error(
                         "handle_commit_event".to_string(),
@@ -363,6 +525,7 @@ where
                 height,
                 round,
                 lock_round,
+                ..
             } => {
                 if height != self.height {
                     return Ok(());
@@ -388,6 +551,14 @@ where
 
     fn handle_resp(&mut self, msg: Option<VerifyResp>) -> ConsensusResult<()> {
         let resp = msg.ok_or_else(|| ConsensusError::Other("Event sender dropped".to_string()))?;
+
+        if !self.rr.on_inactivated() {
+            self.rr.receive(
+                RRData::from_vector(Self::SOURCE_VERIFY_RESP, resp.clone().rr_vc.unwrap()),
+                "state handle_resp".to_string(),
+            );
+        }
+
         if resp.height != self.height {
             return Ok(());
         }
@@ -414,26 +585,28 @@ where
             self.votes
                 .get_qc_by_hash(self.height, block_hash.clone(), VoteType::Precommit)
         {
-            self.state_machine.trigger(SMRTrigger {
+            self.trigger_state_machine(SMRTrigger {
                 trigger_type: TriggerType::PrecommitQC,
                 source:       TriggerSource::State,
                 hash:         qc.block_hash,
                 round:        Some(self.round),
                 height:       self.height,
                 wal_info:     None,
+                rr_vc:        None,
             })?;
         } else if let Some(qc) =
             self.votes
                 .get_qc_by_hash(self.height, block_hash, VoteType::Prevote)
         {
             if qc.round == self.round {
-                self.state_machine.trigger(SMRTrigger {
+                self.trigger_state_machine(SMRTrigger {
                     trigger_type: TriggerType::PrevoteQC,
                     source:       TriggerSource::State,
                     hash:         qc.block_hash,
                     round:        Some(self.round),
                     height:       self.height,
                     wal_info:     None,
+                    rr_vc:        None,
                 })?;
             }
         }
@@ -502,7 +675,21 @@ where
             self.re_check_qcs(qcs)?;
         }
 
-        self.state_machine.new_height_status(status.into())?;
+        // self.state_machine.new_height_status(status.into())?;
+
+        let status: SMRStatus = status.into();
+        let height = status.height;
+        let trigger = TriggerType::NewHeight(status);
+        self.trigger_state_machine(SMRTrigger {
+            trigger_type: trigger.clone(),
+            source: TriggerSource::State,
+            hash: Hash::new(),
+            round: None,
+            height,
+            wal_info: None,
+            rr_vc: None,
+        })?;
+
         Ok(())
     }
 
@@ -560,12 +747,59 @@ where
         self.is_leader = true;
         let ctx = Context::new();
         let (block, hash, polc) = if lock_round.is_none() {
-            let (new_block, new_hash) = self
-                .function
-                .get_block(ctx.clone(), self.height)
-                .await
-                .map_err(|err| ConsensusError::Other(format!("get block error {:?}", err)))?;
-            (new_block, new_hash, None)
+            // let (new_block, new_hash) = self
+            //     .function
+            //     .get_block(ctx.clone(), self.height)
+            //     .await
+            //     .map_err(|err| ConsensusError::Other(format!("get block error {:?}", err)))?;
+            // (new_block, new_hash, None)
+
+            if self.rr.on_inactivated() {
+                let (new_block, new_hash) = self
+                    .function
+                    .get_block(ctx.clone(), self.height)
+                    .await
+                    .map_err(|err| ConsensusError::Other(format!("get block error {:?}", err)))?;
+                (new_block, new_hash, None)
+            } else if self.rr.on_record() {
+                let (new_block, new_hash) = self
+                    .function
+                    .get_block(ctx.clone(), self.height)
+                    .await
+                    .map_err(|err| ConsensusError::Other(format!("get block error {:?}", err)))?;
+
+                self.rr.receive(
+                    RRData::from_sycn_call_json(
+                        Self::SOURCE_UP_CALL_GET_BLOCK,
+                        serde_json::to_string(&(new_block.clone(), new_hash.clone())).unwrap(),
+                    ),
+                    "state, get block".to_string(),
+                );
+                (new_block, new_hash, None)
+            } else {
+                // on replay
+                if let Some(RRData::SyncCallJson { source, json }) =
+                    self.rr.next_sync_json(Self::SOURCE_UP_CALL_GET_BLOCK)
+                {
+                    let (new_block, new_hash): (T, Hash) =
+                        serde_json::from_str(json.as_str()).unwrap();
+
+                    self.rr.receive(
+                        RRData::from_sycn_call_json(
+                            Self::SOURCE_UP_CALL_GET_BLOCK,
+                            serde_json::to_string(&(new_block.clone(), new_hash.clone())).unwrap(),
+                        ),
+                        "state, get block".to_string(),
+                    );
+
+                    (new_block, new_hash, None)
+                } else {
+                    log::error!("state get block replay error");
+                    Err(ConsensusError::Other(format!(
+                        "state get block replay error"
+                    )))?
+                }
+            }
         } else {
             let round = lock_round.clone().unwrap();
             let hash = lock_proposal.unwrap();
@@ -611,13 +845,14 @@ where
         )
         .await;
 
-        self.state_machine.trigger(SMRTrigger {
+        self.trigger_state_machine(SMRTrigger {
             trigger_type: TriggerType::Proposal,
             source:       TriggerSource::State,
             hash:         hash.clone(),
             round:        lock_round,
             height:       self.height,
             wal_info:     None,
+            rr_vc:        None,
         })?;
 
         self.check_block(ctx, hash, block).await;
@@ -711,13 +946,14 @@ where
             hex::encode(hash.clone())
         );
 
-        self.state_machine.trigger(SMRTrigger {
+        self.trigger_state_machine(SMRTrigger {
             trigger_type: TriggerType::Proposal,
             source:       TriggerSource::State,
             hash:         hash.clone(),
             round:        lock_round,
             height:       self.height,
             wal_info:     None,
+            rr_vc:        None,
         })?;
 
         debug!("Overlord: state check the whole block");
@@ -875,11 +1111,56 @@ where
         };
 
         let ctx = Context::new();
-        let status = self
-            .function
-            .commit(ctx.clone(), height, commit)
-            .await
-            .map_err(|err| ConsensusError::Other(format!("commit error {:?}", err)))?;
+
+        // let status = self
+        //     .function
+        //     .commit(ctx.clone(), height, commit)
+        //     .await
+        //     .map_err(|err| ConsensusError::Other(format!("commit error {:?}", err)))?;
+
+        let status = if self.rr.on_inactivated() {
+            let status = self
+                .function
+                .commit(ctx.clone(), height, commit)
+                .await
+                .map_err(|err| ConsensusError::Other(format!("commit error {:?}", err)))?;
+            status
+        } else if self.rr.on_record() {
+            let status = self
+                .function
+                .commit(ctx.clone(), height, commit)
+                .await
+                .map_err(|err| ConsensusError::Other(format!("commit error {:?}", err)))?;
+
+            self.rr.receive(
+                RRData::from_sycn_call_json(
+                    Self::SOURCE_UP_CALL_COMMIT,
+                    serde_json::to_string(&status).unwrap(),
+                ),
+                "state, commit".to_string(),
+            );
+            status
+        } else {
+            // on replay
+            if let Some(RRData::SyncCallJson { source, json }) =
+                self.rr.next_sync_json(Self::SOURCE_UP_CALL_COMMIT)
+            {
+                let status: Status = serde_json::from_str(json.as_str()).unwrap();
+
+                self.rr.receive(
+                    RRData::from_sycn_call_json(
+                        Self::SOURCE_UP_CALL_COMMIT,
+                        serde_json::to_string(&status).unwrap(),
+                    ),
+                    "state, commit".to_string(),
+                );
+
+                status
+            } else {
+                log::error!("state commit replay error");
+                Err(ConsensusError::Other(format!("state commit replay error")))?
+            }
+        };
 
         let mut auth_list = status.authority_list.clone();
         self.authority.update(&mut auth_list);
@@ -1015,13 +1296,14 @@ where
             hex::encode(block_hash.clone())
         );
 
-        self.state_machine.trigger(SMRTrigger {
+        self.trigger_state_machine(SMRTrigger {
             trigger_type: vote_type.clone().into(),
             source:       TriggerSource::State,
             hash:         block_hash,
             round:        Some(round),
             height:       self.height,
             wal_info:     None,
+            rr_vc:        None,
         })?;
         Ok(())
     }
@@ -1132,13 +1414,14 @@ where
             hex::encode(qc_hash.clone())
         );
 
-        self.state_machine.trigger(SMRTrigger {
+        self.trigger_state_machine(SMRTrigger {
             trigger_type: qc_type.into(),
             source:       TriggerSource::State,
             hash:         qc_hash,
             round:        Some(round),
             height:       self.height,
             wal_info:     None,
+            rr_vc:        None,
         })?;
         Ok(())
     }
@@ -1168,13 +1451,14 @@ where
                     hex::encode(block_hash.clone())
                 );
 
-                self.state_machine.trigger(SMRTrigger {
+                self.trigger_state_machine(SMRTrigger {
                     trigger_type: qc.vote_type.into(),
                     source:       TriggerSource::State,
                     hash:         block_hash,
                     round:        Some(self.round),
                     height:       self.height,
                     wal_info:     None,
+                    rr_vc:        None,
                 })?;
                 return Ok(());
             }
@@ -1205,13 +1489,14 @@ where
                 hex::encode(block_hash.clone())
             );
 
-            self.state_machine.trigger(SMRTrigger {
+            self.trigger_state_machine(SMRTrigger {
                 trigger_type: vote_type.clone().into(),
                 source:       TriggerSource::State,
                 hash:         block_hash,
                 round:        Some(self.round),
                 height:       self.height,
                 wal_info:     None,
+                rr_vc:        None,
             })?;
         }
         Ok(())
@@ -1316,13 +1601,14 @@ where
             })?;
         self.chokes.set_qc(choke.round, aggregated_choke);
 
-        self.state_machine.trigger(SMRTrigger {
+        self.trigger_state_machine(SMRTrigger {
             trigger_type: TriggerType::ContinueRound,
             source:       TriggerSource::State,
             hash:         Hash::new(),
             round:        Some(choke.round + 1),
             height:       self.height,
             wal_info:     None,
+            rr_vc:        None,
         })?;
         Ok(())
     }
@@ -1671,13 +1957,14 @@ where
                 self.height
             );
 
-            self.state_machine.trigger(SMRTrigger {
+            self.trigger_state_machine(SMRTrigger {
                 trigger_type: TriggerType::ContinueRound,
                 source:       TriggerSource::State,
                 hash:         Hash::new(),
                 round:        Some(round + 1),
                 height:       self.height,
                 wal_info:     None,
+                rr_vc:        None,
             })?;
         }
         Ok(())
@@ -1686,8 +1973,6 @@ where
     async fn check_block(&mut self, ctx: Context, hash: Hash, block: T) {
         let height = self.height;
         let round = self.round;
-        let function = Arc::clone(&self.function);
-        let resp_tx = self.resp_tx.clone();
 
         trace::custom(
             "check_block".to_string(),
@@ -1698,22 +1983,20 @@ where
             })),
         );
 
-        tokio::spawn(async move {
-            if let Err(e) =
-                check_current_block(ctx, function, height, round, hash.clone(), block, resp_tx)
-                    .await
-            {
-                trace::error(
-                    "check_block".to_string(),
-                    Some(json!({
-                        "height": height,
-                        "hash": hex::encode(hash),
-                    })),
-                );
+        let mut vc = None;
 
-                error!("Overlord: state check block failed: {:?}", e);
-            }
-        });
+        if self.rr.on_replay() || self.rr.on_record() {
+            vc = Some(self.rr.send("send verify req".to_string()));
+        }
+
+        let res = self.verify_req_tx.unbounded_send(VerifyReq::new(
+            // ctx,
+            height, round, hash, block, vc,
+        ));
+
+        if let Err(e) = res {
+            log::error!("up call to check_block error: {}", e);
+        }
     }
 
     async fn save_wal(&mut self, step: Step, lock: Option<WalLock<T>>) -> ConsensusResult<()> {
@@ -1817,13 +2100,14 @@ where
             self.handle_brake(self.round, lock_round).await?;
         }
 
-        self.state_machine.trigger(SMRTrigger {
+        self.trigger_state_machine(SMRTrigger {
             trigger_type: TriggerType::WalInfo,
             source:       TriggerSource::State,
             hash:         Hash::new(),
             round:        None,
             height:       self.height,
             wal_info:     Some(wal_info.into_smr_base()),
+            rr_vc:        None,
         })?;
         Ok(())
     }
@@ -1939,30 +2223,24 @@ where
 
         false
     }
-}
 
-async fn check_current_block<U: Consensus<T>, T: Codec>(
-    ctx: Context,
-    function: Arc<U>,
-    height: u64,
-    round: u64,
-    hash: Hash,
-    block: T,
-    tx: UnboundedSender<VerifyResp>,
-) -> ConsensusResult<()> {
-    function
-        .check_block(ctx, height, hash.clone(), block)
-        .await
-        .map_err(|err| ConsensusError::Other(format!("check {} block error {:?}", height, err)))?;
+    fn trigger_state_machine(&mut self, mut trigger: SMRTrigger) -> ConsensusResult<()> {
+        if self.rr.on_replay() || self.rr.on_record() {
+            let comment = format!(
+                "state send trigger to smr : {}",
+                trigger.clone().trigger_type
+            );
+            let vc = self.rr.send(comment);
+            trigger.rr_vc = Some(vc);
+        }
 
-    debug!("Overlord: state check block {}", true);
-    tx.unbounded_send(VerifyResp {
-        height,
-        round,
-        block_hash: hash,
-        is_pass: true,
-    })
-    .map_err(|e| ConsensusError::ChannelErr(e.to_string()))
+        log::info!(
+            "state send trigger to smr: {}",
+            trigger.trigger_type.clone()
+        );
+
+        self.state_machine.trigger(trigger)
+    }
 }
 
 fn mock_init_qc() -> AggregatedVote {
